@@ -75,16 +75,26 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "target/x86_64-pc-windows-msvc/release/dropocr.exe"
+          $exe = Resolve-Path "target/x86_64-pc-windows-msvc/release/dropocr.exe"
           $exeDir = Split-Path $exe
+
+          # 辅助函数：GUI 子系统的 exe（windows_subsystem="windows"）
+          # 用 & 直接调用时 $LASTEXITCODE 不会被正确填充（$null），
+          # 必须用 Start-Process -Wait -PassThru 才能可靠拿到退出码。
+          function Invoke-Exe {
+            param([string]$Path, [string[]]$Arguments = @())
+            $proc = Start-Process -FilePath $Path -ArgumentList $Arguments `
+              -Wait -PassThru -WindowStyle Hidden
+            return $proc.ExitCode
+          }
 
           # 第一步：无参数运行。验证 exe 能正常启动/退出（间接验证
           # windows_subsystem="windows" 链接正确、没有缺 DLL），
           # 顺带验证 Win32 GetTimeZoneInformation FFI 调用不会崩溃
           # （无参数分支里 write_usage_hint 会调用它来生成文件名）。
-          & $exe
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "无参数运行退出码非 0：$LASTEXITCODE"
+          $code = Invoke-Exe $exe
+          if ($code -ne 0) {
+            Write-Error "无参数运行退出码非 0：$code"
             exit 1
           }
           $hint = Get-ChildItem $exeDir -Filter *.txt
@@ -98,9 +108,7 @@ jobs:
 
           # 第二步：造一张带文字的真实图片，模拟真实拖拽场景，
           # 验证真实模型能被加载、检测+识别完整流程能跑完不崩溃、
-          # 不报"初始化失败"/"识别出错"。不对具体识别文本内容做
-          # 断言（识别准确率不是这个冒烟测试要判断的事），只确认
-          # 整条链路在真机上不会当场炸掉。
+          # 不报"初始化失败"/"识别出错"。
           Add-Type -AssemblyName System.Drawing
           $bmp = New-Object System.Drawing.Bitmap 300, 100
           $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -112,9 +120,9 @@ jobs:
           $g.Dispose()
           $bmp.Dispose()
 
-          & $exe $testImg
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "处理测试图片时退出码非 0：$LASTEXITCODE"
+          $code = Invoke-Exe $exe @($testImg)
+          if ($code -ne 0) {
+            Write-Error "处理测试图片时退出码非 0：$code"
             exit 1
           }
           $result = Get-ChildItem $exeDir -Filter *.txt |
