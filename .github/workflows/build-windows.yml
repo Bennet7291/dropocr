@@ -1,0 +1,173 @@
+name: Build Windows x64
+
+# 手动触发：随时想拿一个最新构建来测试，去 Actions 页面点 "Run workflow"。
+# 打 v*.*.* 标签：除了照常构建，还会额外创建一个 GitHub Release 并把
+# zip 挂上去（例如 git tag v0.1.0 && git push origin v0.1.0）。
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+
+# 只有创建 Release 那一步需要写权限，其余步骤都只读。
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build windows-x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # 如果你把 assets/*.onnx 放进了 Git LFS 管理，这里会自动拉取；
+          # 如果没用 LFS（直接 git add 的普通文件），这个选项不影响任何东西。
+          lfs: true
+
+      # 模型文件（det.onnx / rec.onnx / rec_dict.txt）需要你自己按
+      # MODELS.md 的步骤生成后提交到仓库里，CI 没有网络路径能自动
+      # 生成它们。没有这三个文件，下面的编译步骤在 include_bytes!/
+      # include_str! 那一步必然失败——与其让 Rust 编译器甩出一堆和
+      # 真实原因不相关的报错，不如在这里提前用一句人话说清楚。
+      - name: Check required model assets exist
+        shell: bash
+        run: |
+          set -e
+          missing=0
+          for f in assets/det.onnx assets/rec.onnx assets/rec_dict.txt; do
+            if [ ! -s "$f" ]; then
+              echo "::error::缺少（或为空）$f —— 这个文件需要你按仓库根目录 MODELS.md 的步骤自己生成并提交到仓库，CI 无法自动生成它。"
+              missing=1
+            fi
+          done
+          if [ "$missing" = "1" ]; then
+            exit 1
+          fi
+          echo "模型资源文件齐全。"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc
+
+      # 用仓库里已经验证过、锁定版本的 Cargo.lock（--locked 强制精确
+      # 匹配，Cargo.toml 和 Cargo.lock 对不上就直接报错，而不是悄悄
+      # 帮你重新解析依赖），保证 CI 构建的可复现性。
+      - name: Run unit tests
+        run: cargo test --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Build release binary
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      # 冒烟测试：这是本工程唯一一次能在真实 Windows + 真实模型上跑，
+      # 之前只在开发用的 Linux 沙盒里用手写的极简 dummy 模型验证过
+      # 整条链路，从没有机会验证过"真实 PaddleOCR 模型在真实 Windows
+      # 上能不能被 tract 正常加载、推理"，也没验证过 Win32
+      # GetTimeZoneInformation 这个 FFI 调用在真机上是否正常。
+      # 这里补上这两项此前一直标注为"未验证"的关键检查。
+      - name: Smoke test the built exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target/x86_64-pc-windows-msvc/release/dropocr.exe"
+          $exeDir = Split-Path $exe
+
+          # 第一步：无参数运行。验证 exe 能正常启动/退出（间接验证
+          # windows_subsystem="windows" 链接正确、没有缺 DLL），
+          # 顺带验证 Win32 GetTimeZoneInformation FFI 调用不会崩溃
+          # （无参数分支里 write_usage_hint 会调用它来生成文件名）。
+          & $exe
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "无参数运行退出码非 0：$LASTEXITCODE"
+            exit 1
+          }
+          $hint = Get-ChildItem $exeDir -Filter *.txt
+          if (-not $hint) {
+            Write-Error "无参数运行后没有在 exe 目录生成任何说明文件"
+            exit 1
+          }
+          Write-Host "无参数运行 OK，生成内容："
+          Get-Content $hint[0].FullName
+          Remove-Item $hint.FullName
+
+          # 第二步：造一张带文字的真实图片，模拟真实拖拽场景，
+          # 验证真实模型能被加载、检测+识别完整流程能跑完不崩溃、
+          # 不报"初始化失败"/"识别出错"。不对具体识别文本内容做
+          # 断言（识别准确率不是这个冒烟测试要判断的事），只确认
+          # 整条链路在真机上不会当场炸掉。
+          Add-Type -AssemblyName System.Drawing
+          $bmp = New-Object System.Drawing.Bitmap 300, 100
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.Clear([System.Drawing.Color]::White)
+          $font = New-Object System.Drawing.Font "Arial", 28
+          $g.DrawString("Hello 123", $font, [System.Drawing.Brushes]::Black, 10, 10)
+          $testImg = Join-Path $exeDir "smoke_test.png"
+          $bmp.Save($testImg, [System.Drawing.Imaging.ImageFormat]::Png)
+          $g.Dispose()
+          $bmp.Dispose()
+
+          & $exe $testImg
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "处理测试图片时退出码非 0：$LASTEXITCODE"
+            exit 1
+          }
+          $result = Get-ChildItem $exeDir -Filter *.txt |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $result) {
+            Write-Error "处理测试图片后没有生成结果文件"
+            exit 1
+          }
+          $content = Get-Content $result.FullName -Raw
+          Write-Host "OCR 结果文件内容："
+          Write-Host $content
+          if ($content -match "初始化失败|识别出错") {
+            Write-Error "OCR 处理返回了错误信息，真实模型加载或推理可能失败了：`n$content"
+            exit 1
+          }
+          Remove-Item $result.FullName, $testImg
+          Write-Host "冒烟测试全部通过。"
+
+      - name: Package windows-x64.zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "stage"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/dropocr.exe" -Destination $stage
+
+          @"
+          dropocr 使用方法
+          ================
+
+          把图片文件拖拽到 dropocr.exe 上即可，识别结果会以
+          yyyymmdd-hhmmss.txt 的形式出现在 dropocr.exe 所在的
+          同一个文件夹里。支持同时拖拽多个文件，每张图各自生成
+          一个 txt。
+
+          支持的图片格式：webp, jpeg, jpg, png
+
+          不需要安装、不需要联网、不会产生除结果 txt 之外的任何文件。
+          "@ | Out-File -FilePath "$stage/使用说明.txt" -Encoding utf8
+
+          Compress-Archive -Path "$stage/*" -DestinationPath "dropocr-windows-x64.zip"
+          Get-ChildItem "dropocr-windows-x64.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dropocr-windows-x64
+          path: dropocr-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dropocr-windows-x64.zip
+          generate_release_notes: true
