@@ -10,29 +10,8 @@ name = "dropocr"
 path = "src/main.rs"
 
 [dependencies]
-# --- 推理引擎：纯 Rust，无 C/C++ FFI 依赖 ---
-# 已实测验证：从内存字节（include_bytes!，不落盘）加载 ONNX 模型、
-# 动态维度设置、推理、输出解析全链路可用，且推理结果与 onnxruntime
-# 参考实现数值一致（1e-4 精度内）。
-# 只需要 tract-onnx：它通过 `prelude` 转发了 tract-core 里我们需要的
-# 全部类型（TypedModel、TValue、InferenceFact 等），代码中从未直接
-# 写过 tract_core:: 路径，单独声明 tract-core 是多余依赖。
-tract-onnx = "0.21"
-
-# --- 张量运算 ---
-# 必须与 tract 系列保持同一个 ndarray 主版本号（当前是 0.16），
-# 否则 tract 的 Array 类型与本工程自己构造的 Array 类型不兼容，
-# 编译期会报类型不匹配错误。
+tract-onnx = "0.23"
 ndarray = "0.16"
-
-# --- 图像解码 ---
-# 注：image/imageproc 特意锁定在 0.24/0.23 系列（而非最新的 0.25 系列），
-# 因为 0.25 的间接依赖链（image-webp -> pxfm 等）开始要求 2024 年后
-# 才稳定的 Cargo edition2024 特性，新环境下也许没问题，但 0.24/0.23
-# 组合已经过完整实测验证（含真实推理数值比对），依赖树也更精简。
-# image crate 内建 png / jpeg 支持；webp 需要额外开启 feature。
-# imageproc 关闭 default-features，避免它默认打开 image/default
-# （这会连带激活 avif 编码器 ravif，带来不必要的体积和依赖问题）。
 image = { version = "0.24", default-features = false, features = [
     "png",
     "jpeg",
@@ -41,9 +20,6 @@ image = { version = "0.24", default-features = false, features = [
 imageproc = { version = "0.23", default-features = false }
 
 [profile.release]
-# 体积优化：已实测这套配置能把"骨架"部分（不含 OCR 模型本身）
-# 压到约 7-8MB，留给量化后的中英文 OCR 模型约 12MB 预算，
-# 20MB 总目标是可达的。
 opt-level = "z"     # 优先体积而非速度
 lto = true          # 链接时优化，显著减小体积、去除死代码
 codegen-units = 1   # 更彻底的优化（编译变慢，换体积和性能）
